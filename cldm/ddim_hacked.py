@@ -8,11 +8,13 @@ from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, mak
 
 
 class DDIMSampler(object):
-    def __init__(self, model, schedule="linear", **kwargs):
+    def __init__(self, model, schedule="linear", second_model=None, **kwargs):
         super().__init__()
         self.model = model
         self.ddpm_num_timesteps = model.num_timesteps
         self.schedule = schedule
+
+        self.second_model = second_model
 
     def register_buffer(self, name, attr):
         if type(attr) == torch.Tensor:
@@ -75,6 +77,10 @@ class DDIMSampler(object):
                unconditional_conditioning=None, # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                dynamic_threshold=None,
                ucg_schedule=None,
+               save_control_frame_ind=-1,
+               second_cond=None,
+               second_uncond=None,
+               save_folder=None,
                **kwargs
                ):
         if conditioning is not None:
@@ -115,7 +121,11 @@ class DDIMSampler(object):
                                                     unconditional_guidance_scale=unconditional_guidance_scale,
                                                     unconditional_conditioning=unconditional_conditioning,
                                                     dynamic_threshold=dynamic_threshold,
-                                                    ucg_schedule=ucg_schedule
+                                                    ucg_schedule=ucg_schedule,
+                                                    save_control_frame_ind=save_control_frame_ind,
+                                                    second_cond=second_cond,
+                                                    second_uncond=second_uncond,
+                                                    save_folder=save_folder
                                                     )
         return samples, intermediates
 
@@ -126,7 +136,7 @@ class DDIMSampler(object):
                       mask=None, x0=None, img_callback=None, log_every_t=100,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None, dynamic_threshold=None,
-                      ucg_schedule=None):
+                      ucg_schedule=None, save_control_frame_ind=-1, second_cond=None, second_uncond=None, save_folder=None):
         device = self.model.betas.device
         b = shape[0]
         if x_T is None:
@@ -160,14 +170,38 @@ class DDIMSampler(object):
                 assert len(ucg_schedule) == len(time_range)
                 unconditional_guidance_scale = ucg_schedule[i]
 
+            # if i < 3:
+            #     self.model.control_scales = [0.0] * 12 + [0.0]
+            # else:
+            #     self.model.control_scales = [0.0] * 12 + [1.0]
+            
+            # if i > 5:
+            #     self.model.control_scales = [0.0] * 12 + [0.0]
+
             outs = self.p_sample_ddim(img, cond, ts, index=index, use_original_steps=ddim_use_original_steps,
                                       quantize_denoised=quantize_denoised, temperature=temperature,
                                       noise_dropout=noise_dropout, score_corrector=score_corrector,
                                       corrector_kwargs=corrector_kwargs,
                                       unconditional_guidance_scale=unconditional_guidance_scale,
                                       unconditional_conditioning=unconditional_conditioning,
-                                      dynamic_threshold=dynamic_threshold)
+                                      dynamic_threshold=dynamic_threshold, save_control_frame_ind=save_control_frame_ind,
+                                      second_cond=second_cond, second_uncond=second_uncond)
             img, pred_x0 = outs
+
+            # save timestep image
+            # import os
+            # import cv2
+            # import einops
+            # timestep_image_save_folder = os.path.join(save_folder, 'timestep_image', 'frame_' + str(save_control_frame_ind) )
+            # if not os.path.exists(timestep_image_save_folder):
+            #     os.makedirs(timestep_image_save_folder)
+            
+            # x_samples = self.model.decode_first_stage(img)
+            # x_samples = (einops.rearrange(x_samples, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
+
+            # cv2.imwrite(os.path.join(timestep_image_save_folder, '{:0>4d}.jpg'.format(i)), x_samples[0])
+            # save timestep image
+
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)
 
@@ -181,14 +215,22 @@ class DDIMSampler(object):
     def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None,
-                      dynamic_threshold=None):
+                      dynamic_threshold=None, save_control_frame_ind=-1, second_cond=None, second_uncond=None, control_save_dir='controls_temp'):
         b, *_, device = *x.shape, x.device
 
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
             model_output = self.model.apply_model(x, t, c)
         else:
-            model_t = self.model.apply_model(x, t, c)
-            model_uncond = self.model.apply_model(x, t, unconditional_conditioning)
+            second_control = None
+            if second_cond is not None and second_uncond is not None:
+                second_control = self.second_model.apply_model_get_control(x, t, second_cond)
+            model_t = self.model.apply_model(x, t, c, save_control_frame_ind=save_control_frame_ind, second_control=second_control, uncond_flag=False, control_save_dir=control_save_dir)
+
+            second_uncontrol = None
+            if second_cond is not None and second_uncond is not None:
+                second_uncontrol = self.second_model.apply_model_get_control(x, t, second_uncond)
+            model_uncond = self.model.apply_model(x, t, unconditional_conditioning, save_control_frame_ind=save_control_frame_ind, second_control=second_uncontrol, uncond_flag=True, control_save_dir=control_save_dir)
+            
             model_output = model_uncond + unconditional_guidance_scale * (model_t - model_uncond)
 
         if self.model.parameterization == "v":
@@ -233,8 +275,7 @@ class DDIMSampler(object):
     @torch.no_grad()
     def encode(self, x0, c, t_enc, use_original_steps=False, return_intermediates=None,
                unconditional_guidance_scale=1.0, unconditional_conditioning=None, callback=None):
-        timesteps = np.arange(self.ddpm_num_timesteps) if use_original_steps else self.ddim_timesteps
-        num_reference_steps = timesteps.shape[0]
+        num_reference_steps = self.ddpm_num_timesteps if use_original_steps else self.ddim_timesteps.shape[0]
 
         assert t_enc <= num_reference_steps
         num_steps = t_enc
@@ -250,7 +291,7 @@ class DDIMSampler(object):
         intermediates = []
         inter_steps = []
         for i in tqdm(range(num_steps), desc='Encoding Image'):
-            t = torch.full((x0.shape[0],), timesteps[i], device=self.model.device, dtype=torch.long)
+            t = torch.full((x0.shape[0],), i, device=self.model.device, dtype=torch.long)
             if unconditional_guidance_scale == 1.:
                 noise_pred = self.model.apply_model(x_next, t, c)
             else:

@@ -1,10 +1,8 @@
 from share import *
 import config
-
 from cldm.hack import hack_everything
 
 hack_everything(clip_skip=2)
-
 
 import cv2
 import einops
@@ -15,15 +13,14 @@ import random
 
 from pytorch_lightning import seed_everything
 from annotator.util import resize_image, HWC3
-from annotator.hed import HEDdetector
+from annotator.openpose import OpenposeDetector
 from cldm.model import create_model, load_state_dict
 from cldm.ddim_hacked import DDIMSampler
 
-
-apply_hed = HEDdetector()
+apply_openpose = OpenposeDetector()
 
 model = create_model('./models/cldm_v15.yaml').cpu()
-model.load_state_dict(load_state_dict('./models/control_any3_hed.pth', location='cuda'))
+model.load_state_dict(load_state_dict('./models/control_any3_openpose.pth', location='cuda'))
 model = model.cuda()
 ddim_sampler = DDIMSampler(model)
 
@@ -31,12 +28,12 @@ ddim_sampler = DDIMSampler(model)
 def process(input_image, prompt, a_prompt, n_prompt, num_samples, image_resolution, detect_resolution, ddim_steps, guess_mode, strength, scale, seed, eta):
     with torch.no_grad():
         input_image = HWC3(input_image)
-        detected_map = apply_hed(resize_image(input_image, detect_resolution))
+        detected_map, _ = apply_openpose(resize_image(input_image, detect_resolution))
         detected_map = HWC3(detected_map)
         img = resize_image(input_image, image_resolution)
         H, W, C = img.shape
 
-        detected_map = cv2.resize(detected_map, (W, H), interpolation=cv2.INTER_LINEAR)
+        detected_map = cv2.resize(detected_map, (W, H), interpolation=cv2.INTER_NEAREST)
 
         control = torch.from_numpy(detected_map.copy()).float().cuda() / 255.0
         control = torch.stack([control for _ in range(num_samples)], dim=0)
@@ -75,7 +72,7 @@ def process(input_image, prompt, a_prompt, n_prompt, num_samples, image_resoluti
 block = gr.Blocks().queue()
 with block:
     with gr.Row():
-        gr.Markdown("## Control Stable Diffusion with HED Maps")
+        gr.Markdown("## Control Stable Diffusion with Human Pose")
     with gr.Row():
         with gr.Column():
             input_image = gr.Image(source='upload', type="numpy")
@@ -86,7 +83,7 @@ with block:
                 image_resolution = gr.Slider(label="Image Resolution", minimum=256, maximum=768, value=512, step=64)
                 strength = gr.Slider(label="Control Strength", minimum=0.0, maximum=2.0, value=1.0, step=0.01)
                 guess_mode = gr.Checkbox(label='Guess Mode', value=False)
-                detect_resolution = gr.Slider(label="HED Resolution", minimum=128, maximum=1024, value=512, step=1)
+                detect_resolution = gr.Slider(label="OpenPose Resolution", minimum=128, maximum=1024, value=512, step=1)
                 ddim_steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=20, step=1)
                 scale = gr.Slider(label="Guidance Scale", minimum=0.1, maximum=30.0, value=9.0, step=0.1)
                 seed = gr.Slider(label="Seed", minimum=-1, maximum=2147483647, step=1, randomize=True)
@@ -100,4 +97,4 @@ with block:
     run_button.click(fn=process, inputs=ips, outputs=[result_gallery])
 
 
-block.launch(server_name='0.0.0.0')
+block.launch(server_name='127.0.0.0', server_port=7860)

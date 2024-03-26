@@ -2,6 +2,7 @@ import einops
 import torch
 import torch as th
 import torch.nn as nn
+import os
 
 from ldm.modules.diffusionmodules.util import (
     conv_nd,
@@ -325,20 +326,96 @@ class ControlLDM(LatentDiffusion):
         control = control.to(memory_format=torch.contiguous_format).float()
         return x, dict(c_crossattn=[c], c_concat=[control])
 
-    def apply_model(self, x_noisy, t, cond, *args, **kwargs):
+    def apply_model(self, x_noisy, t, cond, save_control_frame_ind=-1, second_control=None, uncond_flag=False, control_save_dir='controls_temp', *args, **kwargs):
         assert isinstance(cond, dict)
         diffusion_model = self.model.diffusion_model
 
         cond_txt = torch.cat(cond['c_crossattn'], 1)
 
+        momentum_control = False
+        momentum_param = 0.1
+        add_str = ''
+        if uncond_flag:
+            add_str = '_uncond'
+
         if cond['c_concat'] is None:
             eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=None, only_mid_control=self.only_mid_control)
         else:
-            control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt)
-            control = [c * scale for c, scale in zip(control, self.control_scales)]
+            if save_control_frame_ind > -1:
+                if momentum_control:
+                    control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt)
+                    control = [c * scale for c, scale in zip(control, self.control_scales)]
+
+                    last_control = None
+                    if save_control_frame_ind > 0:
+                        folder_head = 'controls/' + control_save_dir + '/frame_'
+                        control_name_tail = 'control_' + str(int(t)) + add_str +'.pt'
+                        save_folder = folder_head + str(save_control_frame_ind - 1)
+                        if not os.path.exists(save_folder):
+                            os.makedirs(save_folder)
+                        save_name = save_folder + '/' + control_name_tail
+                        last_control = torch.load(save_name)
+
+                    if last_control is not None:
+                        control = [momentum_param * control[c] + (1.0 - momentum_param) * last_control[c] for c in range(len(control))]
+
+                    folder_head = 'controls/' + control_save_dir + '/frame_'
+                    control_name_tail = 'control_' + str(int(t)) + add_str + '.pt'
+                    save_folder = folder_head + str(save_control_frame_ind)
+                    if not os.path.exists(save_folder):
+                        os.makedirs(save_folder)
+                    save_name = save_folder + '/' + control_name_tail
+                    torch.save(control, save_name)
+
+                else:
+                    control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt)
+                    control = [c * scale for c, scale in zip(control, self.control_scales)]
+
+                    if second_control is not None:
+                        control = [control[c] + second_control[c] for c in range(len(control))]
+                # folder_head = 'controls_origin/frame_'
+                # control_name_tail = 'control_' + str(int(t)) + '.pt'
+                # save_folder = folder_head + str(save_control_frame_ind)
+                # if not os.path.exists(save_folder):
+                #     os.makedirs(save_folder)
+                # save_name = save_folder + '/' + control_name_tail
+                # torch.save(control, save_name)
+
+                # inter_window = 10
+
+                # if save_control_frame_ind % inter_window > 0:
+                #     head_control_name = folder_head + str(save_control_frame_ind//inter_window * inter_window) + '/' + control_name_tail
+                #     tail_control_name = folder_head + str(save_control_frame_ind//inter_window * inter_window + inter_window) + '/' + control_name_tail
+                #     print(head_control_name)
+                #     print(tail_control_name)
+                #     head_control = torch.load(head_control_name)
+                #     tail_control = torch.load(tail_control_name)
+                #     control = []
+                #     for control_ind in range(len(head_control)):
+                #         divide_part = (save_control_frame_ind % inter_window) / float(inter_window)
+                #         control.append((tail_control[control_ind] - head_control[control_ind]) * divide_part + head_control[control_ind])
+                # else:
+                #     control = torch.load(save_name)
+            else:
+                control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt)
+                control = [c * scale for c, scale in zip(control, self.control_scales)]
+
+                if second_control is not None:
+                    control = [control[c] + second_control[c] for c in range(len(control))]
+
             eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control)
 
         return eps
+    
+    def apply_model_get_control(self, x_noisy, t, cond):
+        assert isinstance(cond, dict)
+
+        cond_txt = torch.cat(cond['c_crossattn'], 1)
+
+        control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt)
+        control = [c * scale for c, scale in zip(control, self.control_scales)]
+
+        return control
 
     @torch.no_grad()
     def get_unconditional_conditioning(self, N):
